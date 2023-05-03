@@ -43,17 +43,19 @@ class PointsInPolygonsCollector  {
   std::vector<vec1f> z_ground;
 
   int ground_class, building_class;
-  
+
   public:
   Box completearea_bb;
   float min_ground_elevation = std::numeric_limits<float>::max();
+  // estimated min ground elevation in case there is no point classified as ground
+  float min_total_elevation = std::numeric_limits<float>::max();
 
   PointsInPolygonsCollector(
-    gfSingleFeatureInputTerminal& polygons, 
-    gfSingleFeatureInputTerminal& buf_polygons, 
-    gfSingleFeatureOutputTerminal& point_clouds, 
-    gfSingleFeatureOutputTerminal& ground_elevations, 
-    float& cellsize, 
+    gfSingleFeatureInputTerminal& polygons,
+    gfSingleFeatureInputTerminal& buf_polygons,
+    gfSingleFeatureOutputTerminal& point_clouds,
+    gfSingleFeatureOutputTerminal& ground_elevations,
+    float& cellsize,
     float& buffer,
     int ground_class=2,
     int building_class=6
@@ -80,7 +82,7 @@ class PointsInPolygonsCollector  {
     // build an index grid for the polygons
 
     // build raster index (pindex) and store for each raster cell all the polygons with intersecting bbox (pindex_vals)
-    float minx = completearea_bb.min()[0]-buffer; 
+    float minx = completearea_bb.min()[0]-buffer;
     float miny = completearea_bb.min()[1]-buffer;
     float maxx = completearea_bb.max()[0]+buffer;
     float maxy = completearea_bb.max()[1]+buffer;
@@ -140,6 +142,7 @@ class PointsInPolygonsCollector  {
       if (GridTest(buf_poly_grids[poly_i], pipoint)) {
         auto& point_cloud = point_clouds.get<PointCollection&>(poly_i);
         auto classification = point_cloud.get_attribute_vec1i("classification");
+        min_total_elevation = std::min(min_total_elevation, point[2]);
         if (point_class == ground_class) {
           // point_clouds_ground[poly_i].push_back(point[2]);
           min_ground_elevation = std::min(min_ground_elevation, point[2]);
@@ -160,8 +163,11 @@ class PointsInPolygonsCollector  {
   void compute_ground_elevation(float& ground_percentile) {
     // Compute average elevation per polygon
     std::cout <<"Computing the average elevation per polygon..." << std::endl;
+
     for (size_t i=0; i<z_ground.size(); ++i) {
-      float ground_ele = min_ground_elevation;
+      float ground_ele = min_total_elevation;
+      if (min_ground_elevation < std::numeric_limits<float>::max())
+        float ground_ele = min_ground_elevation;
       if (z_ground[i].size()!=0) {
         std::sort(z_ground[i].begin(), z_ground[i].end(), [](auto& z1, auto& z2) {
           return z1 < z2;
@@ -182,10 +188,10 @@ std::vector<std::string> split_string(const std::string& s, std::string delimite
   size_t last = 0;
   size_t next = 0;
 
-  while ((next = s.find(delimiter, last)) != std::string::npos) { 
+  while ((next = s.find(delimiter, last)) != std::string::npos) {
     parts.push_back(s.substr(last, next-last));
     last = next + 1;
-  } 
+  }
   parts.push_back(s.substr(last));
   return parts;
 }
@@ -204,7 +210,7 @@ void LASInPolygonsNode::process() {
     LASreadOpener lasreadopener;
     lasreadopener.set_file_name(filepath.c_str());
     LASreader* lasreader = lasreadopener.open();
-    
+
     if (!lasreader){
       std::cout << "cannot read las file: " << filepath << "\n";
       continue;
@@ -230,10 +236,10 @@ void LASInPolygonsNode::process() {
     while (lasreader->read_point()) {
       pip_collector.add_point(
         {
-        float(lasreader->point.get_x()-(*manager.data_offset)[0]), 
+        float(lasreader->point.get_x()-(*manager.data_offset)[0]),
         float(lasreader->point.get_y()-(*manager.data_offset)[1]),
-        float(lasreader->point.get_z()-(*manager.data_offset)[2]) 
-        }, 
+        float(lasreader->point.get_z()-(*manager.data_offset)[2])
+        },
         lasreader->point.get_classification()
       );
     }
@@ -319,7 +325,7 @@ void EptInPolygonsNode::process()
       float py = view->getFieldAs<float>(pdal::Dimension::Id::Y, p) - (*manager.data_offset)[1];
       float pz = view->getFieldAs<float>(pdal::Dimension::Id::Z, p) - (*manager.data_offset)[2];
       int pclass = view->getFieldAs<int>(pdal::Dimension::Id::Classification, p);
-      
+
       pip_collector.add_point({px, py, pz}, pclass);
     }
   }
