@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project (building-reconstruction VERSION 0.3.2)
+project (building-reconstruction VERSION 0.4.5)
 
 option(GFP_WITH_PDAL "Build parts dependent on PDAL" OFF)
 
@@ -17,7 +17,7 @@ endif(GFP_WITH_PDAL)
 add_library(ptinpoly STATIC thirdparty/ptinpoly/ptinpoly.c)
 set_target_properties(
   ptinpoly PROPERTIES 
-  C_STANDARD 11
+  C_STANDARD 90
   POSITION_INDEPENDENT_CODE ON
 )
 
@@ -81,6 +81,7 @@ geoflow_create_plugin(
   src/MeshSimplify.cpp
   src/MeshGridSimplify.cpp
   src/Mesh2TriangleCollectionNode.cpp
+  src/tinsimp.cpp
 )
 
 target_include_directories(gfp_buildingreconstruction PRIVATE

@@ -15,6 +15,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #pragma once
 
+#include <geoflow/common.hpp>
 #include <geoflow/geoflow.hpp>
 
 #include "arrangement.hpp"
@@ -541,7 +542,6 @@ namespace geoflow::nodes::stepedge {
   // };
 
   class DetectPlanesNode:public Node {
-    bool only_horizontal = true;
     float horiz_min_count = 0.95;
     int metrics_normal_k = 5;
     int metrics_plane_k = 15;
@@ -549,9 +549,21 @@ namespace geoflow::nodes::stepedge {
     float metrics_plane_epsilon = 0.2;
     float metrics_plane_normal_threshold = 0.75;
     float metrics_is_horizontal_threshold = 0.97;
+    float metrics_probability_ransac = 0.05;
+    float metrics_cluster_epsilon_ransac = 0.3;
     float metrics_is_wall_threshold = 0.3;
     int n_refit = 5;
+    bool use_ransac = false;
     // float roof_percentile=0.5;
+
+    // plane regularisation
+    float maximum_angle_ = 25;
+    float maximum_offset_ = 0.5;
+    bool regularize_parallelism_ = false;
+    bool regularize_orthogonality_ = false;
+    bool regularize_coplanarity_ = false;
+    bool regularize_axis_symmetry_ = false;
+
     public:
     using Node::Node;
     void init() override {
@@ -559,7 +571,6 @@ namespace geoflow::nodes::stepedge {
       add_output("plane_id", typeid(vec1i));
       add_output("is_wall", typeid(vec1i));
       add_output("is_horizontal", typeid(vec1i));
-      add_output("planes", typeid(Plane));
       
       add_output("pts_per_roofplane", typeid(IndexedPlanesWithPoints ));
 
@@ -576,16 +587,25 @@ namespace geoflow::nodes::stepedge {
       add_output("total_roofplane_cnt", typeid(int));
       add_output("plane_adj", typeid(std::map<size_t, std::map<size_t, size_t>>));
 
-      add_param(ParamBool(only_horizontal, "only_horizontal", "Output only horizontal planes"));
+      add_param(ParamBool(use_ransac, "use_ransac", "Use ransac instead of region growing plane detection"));
       add_param(ParamFloat(horiz_min_count, "horiz_min_count", "Mininmal point count for horizontal planes"));
       add_param(ParamInt(metrics_normal_k, "metrics_normal_k", "Number of neighbours used for normal estimation"));
       add_param(ParamInt(metrics_plane_k, "metrics_plane_k", "Number of neighbours used during region growing plane detection"));
       add_param(ParamInt(metrics_plane_min_points, "metrics_plane_min_points", "Minimum number of points in a plane"));
       add_param(ParamFloat(metrics_plane_epsilon, "metrics_plane_epsilon", "Plane epsilon"));
+      add_param(ParamFloat(metrics_cluster_epsilon_ransac, "metrics_cluster_epsilon_ransac", "Cluster epsilon RANSAC only"));
+      add_param(ParamFloat(metrics_probability_ransac, "metrics_probability_ransac", "Probability RANSAC only"));
       add_param(ParamFloat(metrics_plane_normal_threshold, "metrics_plane_normal_threshold", "Plane normal angle threshold"));
       add_param(ParamFloat(metrics_is_horizontal_threshold, "metrics_is_horizontal_threshold", "Threshold for horizontal plane detection (expressed as angle wrt unit verctor in +z direction)"));
       add_param(ParamFloat(metrics_is_wall_threshold, "metrics_is_wall_threshold", "Wall angle thres"));
       add_param(ParamInt(n_refit, "n_refit", "Refit every n points"));
+
+      add_param(ParamBool(regularize_parallelism_, "regularize_parallelism", "regularizeparallelism"));
+      add_param(ParamBool(regularize_orthogonality_, "regularize_orthogonality", "regularizeorthogonality"));
+      add_param(ParamBool(regularize_coplanarity_, "regularize_coplanarity", "regularizecoplanarity"));
+      add_param(ParamBool(regularize_axis_symmetry_, "regularize_axis_symmetry", "regularize_axis_symmetry"));
+      add_param(ParamFloat(maximum_angle_, "maximum_angle", "Plane regularisation: maximum allowed angle in degrees between plane normals used for parallelism, orthogonality, and axis symmetry"));
+      add_param(ParamFloat(maximum_offset_, "maximum_offset", "Plane regularisation: maximum allowed orthogonal distance between two parallel planes such that they are considered to be coplanar"));
       // add_param(ParamBoundedFloat(roof_percentile, 0, 1, "roof_percentile",  "Roof elevation percentile"));
     }
     // void before_gui(){
@@ -920,6 +940,26 @@ namespace geoflow::nodes::stepedge {
 
   };
 
+  class RoofPartition3DBAGRasteriseNode:public Node {
+    float cellsize = 0.5;
+
+    public:
+    using Node::Node;
+    void init() override {
+      add_input("lod12_roofparts", typeid(geoflow::LinearRing));
+      add_input("lod13_roofparts", typeid(geoflow::LinearRing));
+      add_input("lod22_roofparts", typeid(geoflow::LinearRing));
+
+      // add_output("values", typeid(vec1f));
+      add_poly_output("lod12_hattr", {typeid(float)});
+      add_poly_output("lod13_hattr", {typeid(float)});
+      add_poly_output("lod22_hattr", {typeid(float)});
+
+      add_param(ParamBoundedFloat(cellsize, 0, 50, "cellsize",  "cellsize"));
+    }
+    void process() override;
+  };
+
   class BuildingRasteriseNode:public Node {
     float cellsize = 0.5;
     bool use_tin = false;
@@ -1072,6 +1112,7 @@ namespace geoflow::nodes::stepedge {
   class PolygonTriangulatorNode:public Node {
     int dupe_threshold_exp = 6;
     bool output_all_triangles = false;
+    bool output_mtc_for_every_input = false;
 
     void triangulate_polygon(LinearRing& ring, vec3f& normals, TriangleCollection& triangles, size_t& ring_id, vec1i& ring_ids);
     public:
@@ -1082,6 +1123,7 @@ namespace geoflow::nodes::stepedge {
       add_output("triangles", typeid(TriangleCollection));
       add_output("multi_triangle_collections", typeid(MultiTriangleCollection));
       add_output("normals", typeid(vec3f));
+      add_output("volumes", typeid(float));
       add_output("ring_ids", typeid(vec1i));
       // add_output("nesting_levels", typeid(vec1i));
 
@@ -1089,6 +1131,7 @@ namespace geoflow::nodes::stepedge {
       // add_output("edges_constr", typeid(vec1i));
 
       add_param(ParamBool(output_all_triangles, "output_all_triangles",  "Also output triangles in holes and outside convex hull."));
+      add_param(ParamBool(output_mtc_for_every_input, "output_mtc_for_every_input",  "Output a MultiTriangleCollection for every input. Otherwise aggregate all inputs into one MultiTriangleCollection. Only applies to Mesh type inputs."));
       add_param(ParamInt(dupe_threshold_exp, "dupe_threshold_exp", "Dupe tolerance exponent"));
 
     }

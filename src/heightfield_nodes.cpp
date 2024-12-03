@@ -15,10 +15,20 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // triangulation
 #include <CGAL/Delaunay_triangulation_2.h>
+#include <CGAL/Kernel/global_functions_3.h>
 #include <CGAL/Triangulation_face_base_with_info_2.h>
 #include <CGAL/Triangulation_hierarchy_2.h>
 #include <CGAL/Projection_traits_xy_3.h>
+#include <CGAL/linear_least_squares_fitting_3.h>
+#include <CGAL/number_utils.h>
+#include <CGAL/Projection_traits_xy_3.h>
+#include <CGAL/Cartesian.h>
+#include <cstddef>
+#include <cmath>
+#include <geoflow/common.hpp>
 
+#include "Raster.h"
+#include "point_edge.h"
 #include "stepedge_nodes.hpp"
 #include "pip_util.hpp"
 
@@ -560,6 +570,138 @@ namespace geoflow::nodes::stepedge {
     I.nodataval = r.noDataVal_;
     I.array = *r.vals_;
     output("image").set(I);
+  }
+
+  void rasterise_ring(LinearRing& polygon, RasterTools::Raster& r) {
+    typedef double                      FT;
+    typedef CGAL::Simple_cartesian<FT>  K;
+
+    K::Plane_3 plane;
+    std::vector<K::Point_3> pts;
+    for (auto& p : polygon) {
+      pts.push_back(K::Point_3(p[0], p[1], p[2]));
+    }
+    // fit plane to polygon pts
+    linear_least_squares_fitting_3(pts.begin(),pts.end(),plane,CGAL::Dimension_tag<0>());
+
+    auto box = polygon.box();
+    auto bb_min = box.min();
+    auto bb_max = box.max();
+    auto cr_min = r.getColRowCoord(bb_min[0], bb_min[1]);
+    auto cr_max = r.getColRowCoord(bb_max[0], bb_max[1]);
+
+    auto points_inside = r.rasterise_polygon(polygon, cr_min, cr_max);
+    for (auto& p : points_inside) {
+      float z_interpolate = -plane.a()/plane.c() * p[0] - plane.b()/plane.c()*p[1] - plane.d()/plane.c();
+      r.add_point(p[0], p[1], z_interpolate, RasterTools::MAX);
+    }
+
+  }
+  
+  void calculate_h_attr(gfSingleFeatureInputTerminal& roofparts, gfMultiFeatureOutputTerminal& h_attr, RasterTools::Raster& r_lod22, float z_offset) {
+    h_attr.add_vector("h_min", typeid(float));
+    h_attr.add_vector("h_max", typeid(float));
+    h_attr.add_vector("h_50p", typeid(float));
+    h_attr.add_vector("h_70p", typeid(float));
+    for (size_t i=0; i< roofparts.size(); ++i) {
+      auto polygon = roofparts.get<LinearRing>(i);
+      auto box = polygon.box();
+      auto bb_min = box.min();
+      auto bb_max = box.max();
+      auto cr_min = r_lod22.getColRowCoord(bb_min[0], bb_min[1]);
+      auto cr_max = r_lod22.getColRowCoord(bb_max[0], bb_max[1]);
+      auto part_points = r_lod22.rasterise_polygon(polygon, cr_min, cr_max, false);
+
+      if(part_points.size()==0) {
+        part_points.insert(part_points.begin(), polygon.begin(), polygon.end());
+      }
+      std::sort(part_points.begin(), part_points.end(), [](auto& p1, auto& p2) {
+        return p1[2] < p2[2];
+      });
+
+      size_t datasize = part_points.size();
+      int elevation_id = std::floor(0.5*float(datasize-1));
+      h_attr.sub_terminal("h_50p").push_back(part_points[elevation_id][2] + z_offset);
+      elevation_id = std::floor(0.7*float(datasize-1));
+      h_attr.sub_terminal("h_70p").push_back(part_points[elevation_id][2] + z_offset);
+      h_attr.sub_terminal("h_min").push_back(part_points[0][2] + z_offset);
+      h_attr.sub_terminal("h_max").push_back(part_points[datasize-1][2] + z_offset);
+    }
+  }
+
+  typedef CGAL::Simple_cartesian<float> CF;
+  CF::Vector_3 calculate_normal_cf(const LinearRing& ring)
+  {
+    float x=0, y=0, z=0;
+    for (size_t i = 0; i < ring.size(); ++i) {
+      const auto &curr = ring[i];
+      const auto &next = ring[(i + 1) % ring.size()];
+      x += (curr[1] - next[1]) * (curr[2] + next[2]);
+      y += (curr[2] - next[2]) * (curr[0] + next[0]);
+      z += (curr[0] - next[0]) * (curr[1] + next[1]);
+    }
+    CF::Vector_3 n(x, y, z);
+    return n / CGAL::approximate_sqrt(n.squared_length());
+  }
+  
+  static constexpr double pi = 3.14159265358979323846;
+  static const CF::Vector_3 up = CF::Vector_3(0,0,1);
+
+  void RoofPartition3DBAGRasteriseNode::process(){
+    auto& lod12_roofparts = input("lod12_roofparts");//.get<LinearRing>();
+    auto& lod13_roofparts = input("lod13_roofparts");//.get<LinearRing>();
+    auto& lod22_roofparts = input("lod22_roofparts");//.get<LinearRing>();
+
+    auto& lod12_hattr = poly_output("lod12_hattr");
+    auto& lod13_hattr = poly_output("lod13_hattr");
+    auto& lod22_hattr = poly_output("lod22_hattr");
+
+    Box box;
+    for (size_t i=0; i< lod22_roofparts.size(); ++i) {
+      auto rpart = lod22_roofparts.get<LinearRing>(i);
+      box.add(rpart.box());
+    }
+    auto boxmin = box.min();
+    auto boxmax = box.max();
+
+    RasterTools::Raster r_lod22 = RasterTools::Raster(cellsize, boxmin[0]-0.5, boxmax[0]+0.5, boxmin[1]-0.5, boxmax[1]+0.5);
+    r_lod22.prefill_arrays(RasterTools::MAX);
+    for (size_t i=0; i< lod22_roofparts.size(); ++i) {
+      auto ring = lod22_roofparts.get<LinearRing>(i);
+      rasterise_ring(ring, r_lod22);
+    }
+    auto z_offset = (*manager.data_offset())[2];
+    calculate_h_attr(lod12_roofparts, lod12_hattr, r_lod22, z_offset);
+    calculate_h_attr(lod13_roofparts, lod13_hattr, r_lod22, z_offset);
+    calculate_h_attr(lod22_roofparts, lod22_hattr, r_lod22, z_offset);
+
+    // compute inclination and azimuth. Both in degrees.
+    lod22_hattr.add_vector("b3_hellingshoek", typeid(float));
+    lod22_hattr.add_vector("b3_azimut", typeid(float));
+    for (size_t i=0; i<lod22_roofparts.size(); ++i) {
+      auto ring = lod22_roofparts.get<LinearRing>(i);
+      auto n = calculate_normal_cf(ring);
+      float azimuth, slope;
+      if (std::isnan(n.x()) || std::isnan(n.y()) || std::isnan(n.z())){
+        azimuth = std::numeric_limits<float>::quiet_NaN();
+        slope = std::numeric_limits<float>::quiet_NaN();
+      } else {
+        slope = CGAL::to_double(CGAL::approximate_angle(n, up));
+        
+        // calculate azimuth from arctan2 (https://en.cppreference.com/w/cpp/numeric/math/atan2)
+        // ie. subtract pi/2, multiply by -1 and then add 2 pi if result is negative (4th quadrant)
+        azimuth = -1 * ( std::atan2(n.y(), n.x()) - pi/2 );
+        if (azimuth<0) {
+          azimuth = 2*pi + azimuth;
+        }
+
+        // convert to degrees
+        azimuth = azimuth * (180/pi);
+      }
+      // push attributes
+      lod22_hattr.sub_terminal("b3_hellingshoek").push_back(slope);
+      lod22_hattr.sub_terminal("b3_azimut").push_back(azimuth);
+    }
   }
 
   void SegmentRasteriseNode::rasterise_input(gfSingleFeatureInputTerminal& input_triangles, RasterTools::Raster& r, size_t& data_pixel_cnt) {
